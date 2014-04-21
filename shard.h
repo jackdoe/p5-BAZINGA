@@ -19,7 +19,8 @@
 #include <sys/param.h>
 #include "perl.h"
 #define MAX_PACKET_LEN 512
-
+#define MIN_SCORE 500
+#define MAX_QUERY_TERMS 5
 #define NOW(x) ((float)clock()/CLOCKS_PER_SEC)
 
 #define FORMAT(fmt,arg...) fmt " [%s()]\n",##arg,__func__
@@ -31,7 +32,6 @@ do {                                                \
 
 #define saypx(fmt,arg...) sayx(fmt " { %s(%d) }",##arg,errno ? strerror(errno) : "undefined error",errno);
 
-#define MAX_QUERY_TERMS 10
 #define STARTUP_ALLOC 10
 #define MIN3(a, b, c) ((a) < (b) ? ((a) < (c) ? (a) : (c)) : ((b) < (c) ? (b) : (c)))
 #define RVAL(s,index) ((s)->runes[(index)].value.u32)
@@ -222,21 +222,6 @@ int rstring_cmp(rstring *a, rstring *b) {
     return 0;
 }
 
-static  int rstring_hamming_n(rstring *a, rstring *b, int n, int give_up) {
-    int dist = 0;
-    int i;
-    for (i = 0; i < n; i++) {
-        if (RVAL(a,i) != RVAL(b,i))
-            if (dist++ > give_up)
-                return dist;
-    }
-    return dist;
-}
-
-int rstring_hamming_smallest(rstring *a, rstring *b, int give_up) {
-    return rstring_hamming_n(a,b,MIN(a->rlen,b->rlen),give_up);
-}
-
 //http://en.wikibooks.org/wiki/Algorithm_Implementation/Strings/Levenshtein_distance#C
 int rstring_levenshtein(rstring *s1, rstring *s2) {
     unsigned int x, y, lastdiag, olddiag;
@@ -302,47 +287,6 @@ void rstring_into_sv(rstring *s, SV* dest) {
         sv_catpvn(dest,(char *) &RVAL(s,i),RLEN(s,i));
     }
 }
-
-int rstring_chain_count(rstring *s) {
-    rstring *tmp = s;
-    int n = 0;
-    while (tmp) {
-        n++;
-        tmp = tmp->next;
-    }
-    return n;
-}
-
-void rstring_swap(rstring *a, rstring *b) {
-    rstring tmp = *a, *tmpnext[2];
-    tmpnext[0] = a->next;
-    tmpnext[1] = b->next;
-    *a = *b;
-    *b = tmp;
-    a->next = tmpnext[0];
-    b->next = tmpnext[1];
-}
-
-// n^2, but shards should be small enough so that does not matter
-// if the shards are so big that this is noticable, then we need more shards
-void rstring_chain_sort_nsquared(rstring *head) {
-    int n = rstring_chain_count(head);
-    int i, j;
-    struct rstring *p, *q ;
-    p = head;
-    for (i = 0; i < n - 1 ;i++) {
-        q = p->next;
-
-        for (j = i + 1; j < n ;j++) {
-            if (rstring_cmp(p,q) > 0){
-                rstring_swap(p,q);
-            }
-            q = q->next;
-        }
-        p = p->next;
-    }
-}
-
 
 void tq_wait_for_work(struct task_queue *tq) {
     pthread_mutex_lock(&tq->lock);
@@ -420,9 +364,7 @@ u16 jscore(rstring *a, rstring *b) {
 
     if (rstring_equal(a,b))
         return 1000;
-    int give_up =  MIN(b->rlen,a->rlen) / 2;
-    if (rstring_hamming_smallest(a,b,give_up) >= give_up)
-        return 0;
+
     u32 dist = rstring_levenshtein(a,b);
     u32 len = MAX(a->rlen,b->rlen);
     return (((len - dist) * 1000) / (len + dist));
@@ -433,7 +375,7 @@ void shard_search(rstring *terms, query *q, ranked_result *ranked) {
     rstring *qs,*ts;
     ranked_result *r;
 
-    u32 score = 0;
+    u16 score = 0;
     int max = -1;
     for (qs = q->s, i = 0; qs != NULL && i < MAX_QUERY_TERMS; qs = qs->next, i++) {
         rune *last = NULL;
@@ -446,6 +388,7 @@ void shard_search(rstring *terms, query *q, ranked_result *ranked) {
             }
             if (score == 0)
                 continue;
+
             r = &ranked[ts->local];
             if (r->score == 0) {
                 memset(r,0,sizeof(*r));
@@ -468,19 +411,23 @@ void shard_search(rstring *terms, query *q, ranked_result *ranked) {
 
     if (--q->done == 0) {
         pthread_mutex_unlock(&q->lock);
-
         D("took: %.5f",NOW() - q->start);
         char buf[MAX_PACKET_LEN];
         int siz = sizeof(buf) - 1;
         int off = 0;
-        for (i = 0; i < MAX_QUERY_TERMS; i++) {
-            if (q->max.ranked_terms[i].score > 0) {
-                off += rstring_to_char(q->max.ranked_terms[i].s,buf + off,siz - off);
-                if (off < siz) {
-                    buf[off] = ' ';
-                    off++;
+        if (q->max.score > 0) {
+            for (i = 0; i < MAX_QUERY_TERMS; i++) {
+                if (q->max.ranked_terms[i].score > 0) {
+                    off += rstring_to_char(q->max.ranked_terms[i].s,buf + off,siz - off);
+                    if (off < siz) {
+                        buf[off] = ' ';
+                        off++;
+                    }
                 }
             }
+        } else {
+            buf[0] = 0;
+            off = 2; // we send only off - 1, so it makes sense to send one 0 if there are no results
         }
         sendto(q->dest_fd,buf,MIN(off - 1,siz),0,(struct sockaddr *)&q->dest_sa,sizeof(q->dest_sa));
         query_destroy(q);
@@ -527,4 +474,75 @@ void shard_spawn_workers(int n, struct task_queue *tq) {
 void ms2tv(struct timeval *result, unsigned long interval_ms) {
     result->tv_sec = (interval_ms / 1000);
     result->tv_usec = ((interval_ms % 1000) * 1000);
+}
+
+// http://www.chiark.greenend.org.uk/~sgtatham/algorithms/listsort.c
+rstring *listsort(rstring *list) {
+    rstring *p, *q, *e, *tail, *oldhead;
+    int insize, nmerges, psize, qsize, i;
+    if (!list)
+	return NULL;
+
+    insize = 1;
+
+    while (1) {
+        p = list;
+        list = NULL;
+        tail = NULL;
+
+        nmerges = 0;  /* count number of merges we do in this pass */
+
+        while (p) {
+            nmerges++;  /* there exists a merge to be done */
+            /* step `insize' places along from p */
+            q = p;
+            psize = 0;
+            for (i = 0; i < insize; i++) {
+                psize++;
+                if (!(q = q->next))
+                    break;
+            }
+
+            /* if q hasn't fallen off end, we have two lists to merge */
+            qsize = insize;
+
+            /* now we have two lists; merge them */
+            while (psize > 0 || (qsize > 0 && q)) {
+                /* decide whether next rstring of merge comes from p or q */
+                if (psize == 0) {
+		    /* p is empty; e must come from q. */
+		    e = q; q = q->next; qsize--;
+		} else if (qsize == 0 || !q) {
+		    /* q is empty; e must come from p. */
+		    e = p; p = p->next; psize--;
+		} else if (rstring_cmp(p,q) <= 0) {
+		    /* First rstring of p is lower (or same);
+		     * e must come from p. */
+		    e = p; p = p->next; psize--;
+		} else {
+		    /* First rstring of q is lower; e must come from q. */
+		    e = q; q = q->next; qsize--;
+		}
+
+                /* add the next rstring to the merged list */
+		if (tail) {
+		    tail->next = e;
+		} else {
+		    list = e;
+		}
+		tail = e;
+            }
+
+            /* now p has stepped `insize' places along, and q has too */
+            p = q;
+        }
+        tail->next = NULL;
+
+        /* If we have done only one merge, we're finished. */
+        if (nmerges <= 1)   /* allow for nmerges==0, the empty list case */
+            return list;
+
+        /* Otherwise repeat, merging lists twice the size */
+        insize *= 2;
+    }
 }

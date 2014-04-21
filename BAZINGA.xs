@@ -112,7 +112,7 @@ index_and_serve(unsigned short port, unsigned short n_workers,unsigned short max
     hv_undef(dup);
 
     for (i = 0; i < n; i++) {
-        rstring_chain_sort_nsquared(shards[i]);
+        shards[i] = listsort(shards[i]);
     }
 
     D("index is ready with %d shards",n);
