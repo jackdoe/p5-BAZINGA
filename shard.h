@@ -523,3 +523,8 @@ void shard_spawn_workers(int n, struct task_queue *tq) {
     }
     pthread_attr_destroy(&attr);
 }
+
+void ms2tv(struct timeval *result, unsigned long interval_ms) {
+    result->tv_sec = (interval_ms / 1000);
+    result->tv_usec = ((interval_ms % 1000) * 1000);
+}

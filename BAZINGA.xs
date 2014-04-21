@@ -18,14 +18,13 @@ MODULE = BAZINGA		PACKAGE = BAZINGA
 SV *
 query(SV *server, unsigned short port, SV *typo, int timeout_ms)
     CODE:
-    if (timeout_ms > 999)
-        croak("timeout_ms can be between 1 and 999");
     RETVAL = &PL_sv_undef;
     if (SvOK(server) && SvOK(typo)) {
         struct sockaddr_in servaddr;
         int sockfd = socket(AF_INET,SOCK_DGRAM,0);
         if (sockfd > 0) {
-            struct timeval tv = { .tv_sec = 0, .tv_usec = timeout_ms * 1000};
+            struct timeval tv;
+            ms2tv(&tv,timeout_ms);
             if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,&tv,sizeof(tv)) == 0) {
                 bzero(&servaddr,sizeof(servaddr));
                 servaddr.sin_family      = AF_INET;
