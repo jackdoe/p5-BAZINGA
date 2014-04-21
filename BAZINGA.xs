@@ -50,7 +50,7 @@ query(SV *server, unsigned short port, SV *typo, int timeout_ms)
         RETVAL
 
 void
-index_and_serve(unsigned short port, unsigned short n_workers,unsigned short max_docs_per_shard, SV *rdocs)
+index_and_serve(unsigned short port, unsigned short n_workers,int max_docs_per_shard, SV *rdocs)
     CODE:
     if (!SvROK(rdocs) || SvTYPE(SvRV(rdocs)) != SVt_PVAV) {
         croak("expected array ref of documents");
