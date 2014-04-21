@@ -288,14 +288,6 @@ void rstring_into_sv(rstring *s, SV* dest) {
     }
 }
 
-void tq_wait_for_work(struct task_queue *tq) {
-    pthread_mutex_lock(&tq->lock);
-    // if there is still work, just return, otherwise wait on the condition
-    // in case a task was added shortly after we thought we are done
-    if (tq->head == NULL)
-        pthread_cond_wait(&tq->cond,&tq->lock);
-    pthread_mutex_unlock(&tq->lock);
-}
 #define Q_APPEND(head,tail,elem)                                \
     do {                                                        \
         if ((head) == NULL)                                     \
@@ -304,36 +296,33 @@ void tq_wait_for_work(struct task_queue *tq) {
             (tail)->next = (elem);                              \
         (tail) = (elem);                                        \
     } while(0);
+
 static int tq_enqueue(struct task_queue *tq,struct query *q) {
     if (tq->cap < 1)
         return -1;
     int j;
     struct task *head = NULL, *tail = NULL;
-
+    pthread_mutex_lock(&tq->lock);
     for (j = 0; j < tq->n_shards; j++) {
         struct task *t = x_malloc(sizeof(*t));
         t->shard = tq->shards[j];
         t->query = q;
         t->next = NULL;
-        Q_APPEND(head,tail,t);
+        Q_APPEND(tq->head,tq->tail,t);
     }
 
-    pthread_mutex_lock(&tq->lock);
     tq->cap -= tq->n_shards;
-    Q_APPEND(tq->head,tq->tail,head);
     pthread_cond_signal(&tq->cond);
     pthread_mutex_unlock(&tq->lock);
     return 0;
 }
-
-struct task *tq_dequeue(struct task_queue *tq) {
+#undef Q_APPEND
+struct task *tq_dequeue_locked(struct task_queue *tq) {
     struct task *t = NULL;
-    pthread_mutex_lock(&tq->lock);
     if ((t = tq->head) != NULL) {
         tq->head = t->next;
         tq->cap++;
     }
-    pthread_mutex_unlock(&tq->lock);
     return t;
 }
 
@@ -410,7 +399,6 @@ void shard_search(rstring *terms, query *q, ranked_result *ranked) {
         q->max = ranked[max];
 
     if (--q->done == 0) {
-        pthread_mutex_unlock(&q->lock);
         D("took: %.5f",NOW() - q->start);
         char buf[MAX_PACKET_LEN];
         int siz = sizeof(buf) - 1;
@@ -430,6 +418,7 @@ void shard_search(rstring *terms, query *q, ranked_result *ranked) {
             off = 2; // we send only off - 1, so it makes sense to send one 0 if there are no results
         }
         sendto(q->dest_fd,buf,MIN(off - 1,siz),0,(struct sockaddr *)&q->dest_sa,sizeof(q->dest_sa));
+        pthread_mutex_unlock(&q->lock);
         query_destroy(q);
     } else {
         pthread_mutex_unlock(&q->lock);
@@ -438,19 +427,23 @@ void shard_search(rstring *terms, query *q, ranked_result *ranked) {
 
 void *shard_worker(void *p) {
     struct task_queue *tq = (struct task_queue *) p;
-    struct task *t;
+    struct task *t = NULL;
     size_t ranked_size = sizeof(struct ranked_result) * tq->max_docs_per_shard;
     ranked_result *ranked = x_malloc(ranked_size);
     D("ping! allocated: %zu ranked_result buffer for %d max_docs_per_shard",ranked_size,tq->max_docs_per_shard);
     int i;
     for (;;) {
-        while ((t = tq_dequeue(tq)) != NULL) {
+        if (t) {
             for (i = 0; i < tq->max_docs_per_shard; i++)
                 ranked[i].score = 0;
             shard_search(t->shard,t->query,ranked);
             free(t);
         }
-        tq_wait_for_work(tq);
+        pthread_mutex_lock(&tq->lock);
+        t = tq_dequeue_locked(tq);
+        if (t == NULL)
+            pthread_cond_wait(&tq->cond,&tq->lock);
+        pthread_mutex_unlock(&tq->lock);
     }
     pthread_exit(NULL);
 }

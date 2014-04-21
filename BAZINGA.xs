@@ -99,6 +99,7 @@ index_and_serve(unsigned short port, unsigned short n_workers,unsigned short max
                 hv_store(dup,key,len,newSVpvn((char *)ts,sizeof(*ts)),0);
             }
             sv_setpvn(bsv,"", 0);
+
             ts->local = ndocs[id];
             if (ts->next == NULL) {
                 // make the last token point to the current head
@@ -117,7 +118,7 @@ index_and_serve(unsigned short port, unsigned short n_workers,unsigned short max
 
     D("index is ready with %d shards",n);
     struct task_queue tq = {
-        .cap = 100000,
+        .cap = 10000,
         .lock = PTHREAD_MUTEX_INITIALIZER,
         .cond = PTHREAD_COND_INITIALIZER,
         .shards = shards,
