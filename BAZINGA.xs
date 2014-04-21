@@ -58,12 +58,12 @@ index_and_serve(unsigned short port, unsigned short n_workers,int max_docs_per_s
     AV *docs = (AV *) SvRV(rdocs);
     int len = av_len(docs),i,n,rc,sockfd;
     n = 1 + (len / max_docs_per_shard);
-    struct shard shards[n];
     struct sockaddr_in servaddr,cliaddr;
     socklen_t slen;
     char mesg[MAX_PACKET_LEN];
 
-    memset(shards,0,sizeof(shards));
+    struct shard *shards = x_malloc(sizeof(*shards) * n);
+    memset(shards,0,sizeof(*shards) * n);
     HV* dup = newHV();
     SV* bsv = newSVpvn("",0);
     // FIXME: this whole thing must be rewritten
@@ -100,8 +100,8 @@ index_and_serve(unsigned short port, unsigned short n_workers,int max_docs_per_s
 
             ts->local = shards[id].ndocs;
             tmp = ts->next;
-            ts->next = shards[id].terms[RBYTE(ts,0)];
-            shards[id].terms[RBYTE(ts,0)] = ts;
+            ts->next = shards[id].terms[RPREFIX(ts)];
+            shards[id].terms[RPREFIX(ts)] = ts;
             ts = tmp;
         }
         shards[id].ndocs++;
@@ -109,7 +109,7 @@ index_and_serve(unsigned short port, unsigned short n_workers,int max_docs_per_s
     hv_undef(dup);
     int j;
     for (i = 0; i < n; i++) {
-        for (j = 0; j < 256; j++) {
+        for (j = 0; j < PREFIXES; j++) {
             shards[i].terms[j] = listsort(shards[i].terms[j]);
         }
     }
@@ -147,3 +147,4 @@ index_and_serve(unsigned short port, unsigned short n_workers,int max_docs_per_s
             execute_query(&tq,mesg,rc,cliaddr,sockfd);
         }
     }
+    // FIXME: cleanup.

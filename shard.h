@@ -22,7 +22,6 @@
 #define MIN_SCORE 500
 #define MAX_QUERY_TERMS 10
 #define NOW(x) ((float)clock()/CLOCKS_PER_SEC)
-
 #define FORMAT(fmt,arg...) fmt " [%s()]\n",##arg,__func__
 #define D(fmt,arg...) printf(FORMAT(fmt,##arg))
 #define sayx(fmt,arg...)                            \
@@ -38,6 +37,8 @@ do {                                                \
 #define RBYTE(s,index) ((s)->runes[(index)].value.u8[0])
 #define RPTR(s,index) (&(s)->runes[(index)])
 #define RLEN(s,index) ((s)->runes[(index)].len)
+#define RPREFIX(s) (RBYTE(s,0))
+#define PREFIXES 256
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -91,7 +92,7 @@ struct query {
 typedef struct query query;
 
 struct shard {
-    rstring *terms[256];
+    rstring *terms[PREFIXES];
     int ndocs;
 };
 
@@ -351,6 +352,20 @@ void execute_query(struct task_queue *tq, char *buf,int blen,struct sockaddr_in 
     if (rc != 0)
         query_destroy(q);
 }
+inline int rstring_hamming_n(rstring *a, rstring *b, int n, int give_up) {
+    int dist = 0;
+    int i;
+    for (i = 0; i < n; i++) {
+        if (RVAL(a,i) != RVAL(b,i))
+            if (dist++ > give_up)
+                return dist;
+    }
+    return dist;
+}
+
+int rstring_hamming_smallest(rstring *a, rstring *b, int give_up) {
+    return rstring_hamming_n(a,b,MIN(a->rlen,b->rlen),give_up);
+}
 
 u16 jscore(rstring *a, rstring *b) {
     if (a->rlen == 0 || b->rlen == 0)
@@ -358,6 +373,10 @@ u16 jscore(rstring *a, rstring *b) {
 
     if (rstring_equal(a,b))
         return 1000;
+
+    int give_up = MIN(a->rlen,b->rlen) / 2;
+    if (rstring_hamming_smallest(a,b,give_up) >= give_up)
+        return 0;
 
     u32 dist = rstring_levenshtein(a,b);
     u32 len = MAX(a->rlen,b->rlen);
@@ -370,7 +389,7 @@ void shard_search(struct shard *shard, query *q, ranked_result ranked[]) {
     ranked_result *r;
     for (qs = q->s, i = 0; qs != NULL && i < MAX_QUERY_TERMS; qs = qs->next, i++) {
         rune *last = NULL;
-        for (ts = shard->terms[RBYTE(qs,0)]; ts; ts = ts->next) {
+        for (ts = shard->terms[RPREFIX(qs)]; ts; ts = ts->next) {
             if (last == NULL || last != ts->runes) {
                 score = jscore(qs,ts);
                 last = ts->runes;
