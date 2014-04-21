@@ -51,7 +51,6 @@ do {                                                \
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
-
 struct rune {
     u8 len;
     union value {
@@ -113,11 +112,14 @@ struct task {
 struct task_queue {
     struct task *head;
     struct task *tail;
+    volatile int ABORT;
     int cap;
     int n_shards;
+    int n_workers;
     int max_docs_per_shard;
     pthread_mutex_t lock;
     pthread_cond_t cond;
+    int sockfd;
     struct shard *shards;
 };
 
@@ -132,29 +134,27 @@ void *x_realloc(void *x, size_t n) {
 void *x_malloc(size_t n) {
     return x_realloc(NULL,n);
 }
-
 static u32 HASH_P = 5381;
 static u32 DELIM = ' ';
 static u8 U_MASK[] = {192, 224, 240};
+
 // http://zaemis.blogspot.nl/2011/06/reading-unicode-utf-8-by-hand-in-c.html
-int rune_bread(char *buf, off_t *off, size_t blen, rune *dest) {
+int rune_bread(char *begin, off_t *off, size_t blen, rune *dest) {
     dest->len = 0;
     dest->value.u32 = 0;
-
     if (blen - *off < 1)
         return 0;
-    dest->value.u8[0] = buf[*off];
-    dest->len = 1;
 
-    if ((dest->value.u8[0] & U_MASK[0]) == U_MASK[0]) dest->len++;
-    if ((dest->value.u8[0] & U_MASK[1]) == U_MASK[1]) dest->len++;
-    if ((dest->value.u8[0] & U_MASK[2]) == U_MASK[2]) dest->len++;
-
-    if (dest->len > 1) {
-        if (blen - *off < dest->len) {
-            memcpy(&dest->value.u8[1],&buf[*off],dest->len - 1);
-        }
+    u8 byte = begin[*off];
+    if (byte > 0) dest->len++;
+    if ((byte & U_MASK[0]) == U_MASK[0]) dest->len++;
+    if ((byte & U_MASK[1]) == U_MASK[1]) dest->len++;
+    if ((byte & U_MASK[2]) == U_MASK[2]) dest->len++;
+    if (dest->len > 0 && (blen - *off) >= dest->len) {
+        memcpy(&dest->value.u8[0],&begin[*off],dest->len);
+//      wprintf(L"reading %d %lc 0x%x\n",dest->len,dest->value.u32,dest->value.u32);
     }
+
     *off += dest->len;
     return dest->len;
 }
@@ -198,7 +198,7 @@ void rstring_dump(rstring *s,int follow) {
     for (p = s; p ; p = p->next) {
         printf("NEXT: %d: ",p->rlen);
         for(i = 0; i < p->rlen; i++) {
-            wprintf(L"%c",RVAL(p,i));
+            wprintf(L"%lc",RVAL(p,i));
         }
         printf(" [ %p(%p next: %p) ]\n",s,p,p->next);
         if (!follow)
@@ -346,11 +346,18 @@ static void query_destroy(query *q) {
     free(q);
 }
 
-void execute_query(struct task_queue *tq, char *buf,int blen,struct sockaddr_in sa,int fd) {
+void tq_must_die(struct task_queue *tq) {
+    pthread_mutex_lock(&tq->lock);
+    tq->ABORT = 1;
+    pthread_cond_broadcast(&tq->cond); // today is a good day to die, wake everyone up
+    pthread_mutex_unlock(&tq->lock);
+}
+
+void execute_query(struct task_queue *tq, char *buf,int blen,struct sockaddr_in sa) {
     struct query *q = x_malloc(sizeof(*q));
     q->s = rstring_chain_reverse(rstring_tokenize_into_chain(buf,blen,DELIM));
     pthread_mutex_init(&q->lock,NULL);
-    q->dest_fd = fd;
+    q->dest_fd = tq->sockfd;
     q->dest_sa = sa;
     q->start = NOW();
     q->done = tq->n_shards;
@@ -360,6 +367,7 @@ void execute_query(struct task_queue *tq, char *buf,int blen,struct sockaddr_in 
     if (rc != 0)
         query_destroy(q);
 }
+
 inline int rstring_hamming_n(rstring *a, rstring *b, int n, int give_up) {
     int dist = 0;
     int i;
@@ -470,7 +478,7 @@ void *shard_worker(void *p) {
     u8 *filter = x_malloc(filter_size);
     D("ping! allocated: %zukb ranked_result buffer for %d max_docs_per_shard, filter size: %zu",ranked_size/1024,tq->max_docs_per_shard,filter_size);
     int i;
-    for (;;) {
+    while (!tq->ABORT) {
         if (t) {
             shard_search(t->shard,t->query,ranked,filter);
             memset(filter,0,filter_size);
@@ -482,20 +490,75 @@ void *shard_worker(void *p) {
             pthread_cond_wait(&tq->cond,&tq->lock);
         pthread_mutex_unlock(&tq->lock);
     }
+
+    pthread_mutex_lock(&tq->lock);
+    if (--tq->n_workers == 0) {
+        pthread_mutex_unlock(&tq->lock);
+        D("tq(%p)'s last thread died, cleaned up everything",tq);
+
+        while ((t = tq_dequeue_locked(tq)))
+            query_destroy(t->query);
+        pthread_mutex_destroy(&tq->lock);
+        pthread_cond_destroy(&tq->cond);
+        free(tq->shards);
+        free(tq);
+    } else {
+        pthread_mutex_unlock(&tq->lock);
+    }
+    free(ranked);
+    free(filter);
     pthread_exit(NULL);
 }
 
-void shard_spawn_workers(int n, struct task_queue *tq) {
+
+void * tq_server(void *p) {
+    struct task_queue *tq = (struct task_queue *) p;
+    struct sockaddr_in cliaddr;
+    socklen_t slen;
+    char mesg[MAX_PACKET_LEN];
+    int rc;
+    for (;;) {
+        slen = sizeof(cliaddr);
+        rc = recvfrom(tq->sockfd,mesg,sizeof(mesg),0,(struct sockaddr *)&cliaddr,&slen);
+        if (rc > 0) {
+            execute_query(tq,mesg,rc,cliaddr);
+        } else if (rc == -1) {
+            break;
+        }
+    }
+    tq_must_die(tq);
+    pthread_exit(0);
+}
+
+struct task_queue *tq_new(int n_shards) {
+    struct task_queue *tq = x_malloc(sizeof(*tq));
+    memset(tq,0,sizeof(*tq));
+    tq->n_shards = n_shards;
+    tq->shards = x_malloc(sizeof(*tq->shards) * n_shards);
+    memset(tq->shards,0,sizeof(*tq->shards) * n_shards);
+    pthread_mutex_init(&tq->lock,NULL);
+    pthread_cond_init(&tq->cond,NULL);
+    return tq;
+}
+
+void tq_start(struct task_queue *tq, int background) {
     int i;
     pthread_attr_t attr;
+    pthread_t tid;
+    D("init queue with %d workers",tq->n_workers);
     if (pthread_attr_init(&attr) != 0)
         saypx("attr init");
     if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0)
         saypx("setdetachstate");
 
-    for (i = 0; i < n; i++) {
-        pthread_t tid;
+    for (i = 0; i < tq->n_workers; i++) {
         if (pthread_create(&tid,&attr,shard_worker,tq) != 0)
+            saypx("pthread: failed to create thread");
+    }
+    if (background == 0) {
+        tq_server(tq);
+    } else {
+        if (pthread_create(&tid,&attr,tq_server,tq) != 0)
             saypx("pthread: failed to create thread");
     }
     pthread_attr_destroy(&attr);

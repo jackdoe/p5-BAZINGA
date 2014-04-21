@@ -30,8 +30,9 @@ query(SV *server, unsigned short port, SV *typo, int timeout_ms)
                 servaddr.sin_family      = AF_INET;
                 servaddr.sin_addr.s_addr = inet_addr(SvPV_nolen(server));
                 servaddr.sin_port        = htons(port);
-                int len = sv_len_utf8(typo);
-                if (sendto(sockfd,SvPV_nolen(typo),len,0,(struct sockaddr *)&servaddr,sizeof(servaddr)) == len) {
+                STRLEN len;
+                char *buf = SvPV(typo,len);
+                if (sendto(sockfd,buf,len,0,(struct sockaddr *)&servaddr,sizeof(servaddr)) == len) {
                     char buf[MAX_PACKET_LEN];
                     int n;
                     if ((n = recvfrom(sockfd,buf,sizeof(buf),0,NULL,NULL)) > 0) {
@@ -39,6 +40,8 @@ query(SV *server, unsigned short port, SV *typo, int timeout_ms)
                         SvUTF8_on(ret);
                         RETVAL = ret;
                     }
+                } else {
+                    die("failed to send %zu bytes",len);
                 }
             }
             close(sockfd);
@@ -49,21 +52,36 @@ query(SV *server, unsigned short port, SV *typo, int timeout_ms)
     OUTPUT:
         RETVAL
 
-void
-index_and_serve(unsigned short port, unsigned short n_workers,int max_docs_per_shard, SV *rdocs)
+SV *
+index_and_serve(unsigned short port, unsigned short n_workers,int max_docs_per_shard, SV *rdocs, int background)
     CODE:
     if (!SvROK(rdocs) || SvTYPE(SvRV(rdocs)) != SVt_PVAV) {
         croak("expected array ref of documents");
     }
     AV *docs = (AV *) SvRV(rdocs);
-    int len = av_len(docs),i,n,rc,sockfd;
-    n = 1 + (len / max_docs_per_shard);
-    struct sockaddr_in servaddr,cliaddr;
-    socklen_t slen;
-    char mesg[MAX_PACKET_LEN];
+    int len = av_len(docs),i;
+    int n = 1 + (len / max_docs_per_shard);
 
-    struct shard *shards = x_malloc(sizeof(*shards) * n);
-    memset(shards,0,sizeof(*shards) * n);
+    struct task_queue *tq = tq_new(n);
+    tq->cap = 10000;
+    tq->max_docs_per_shard = max_docs_per_shard;
+    tq->n_workers = n_workers;
+    int sockfd = socket(AF_INET,SOCK_DGRAM,0);
+    if (sockfd <= 0)
+        saypx("socket");
+    int op = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &op, sizeof(int)) != 0 )
+        saypx("setsockopt");
+
+    tq->sockfd = sockfd;
+    struct sockaddr_in servaddr;
+    bzero(&servaddr,sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr=htonl(INADDR_ANY);
+    servaddr.sin_port=htons(port);
+    if (bind(tq->sockfd,(struct sockaddr *)&servaddr,sizeof(servaddr)) != 0)
+        saypx("bind");
+
     HV* dup = newHV();
     SV* bsv = newSVpvn("",0);
     // FIXME: this whole thing must be rewritten
@@ -71,7 +89,7 @@ index_and_serve(unsigned short port, unsigned short n_workers,int max_docs_per_s
     // and points strings to use same rune pointers
     // so we can quickly check if a term is equal to another term
     // just by checking its runes pointer
-    for (i = 0; i < len; i++) {
+    for (i = 0; i <= len; i++) {
         SV **svp = av_fetch(docs,i,0);
         
         if (svp == NULL || !SvOK(*svp))
@@ -81,7 +99,6 @@ index_and_serve(unsigned short port, unsigned short n_workers,int max_docs_per_s
         char *buf = SvPV(*svp,blen);
         int id = i % n;
         rstring *tokens = rstring_tokenize_into_chain(buf,blen,DELIM), *ts;
-
         rstring *tmp;
         for (ts = tokens; ts;) {
             // since we have some state in the rstring
@@ -98,53 +115,24 @@ index_and_serve(unsigned short port, unsigned short n_workers,int max_docs_per_s
             }
             sv_setpvn(bsv,"", 0);
 
-            ts->local = shards[id].ndocs;
+            ts->local = tq->shards[id].ndocs;
             tmp = ts->next;
-            ts->next = shards[id].terms[RPREFIX(ts)];
-            shards[id].terms[RPREFIX(ts)] = ts;
+            ts->next = tq->shards[id].terms[RPREFIX(ts)];
+            tq->shards[id].terms[RPREFIX(ts)] = ts;
             ts = tmp;
         }
-        shards[id].ndocs++;
+        tq->shards[id].ndocs++;
     }
     hv_undef(dup);
+
     int j;
     for (i = 0; i < n; i++) {
         for (j = 0; j < PREFIXES; j++) {
-            shards[i].terms[j] = listsort(shards[i].terms[j]);
+            tq->shards[i].terms[j] = listsort(tq->shards[i].terms[j]);
         }
     }
+    tq_start(tq,background);
 
-    D("index is ready with %d shards",n);
-    struct task_queue tq = {
-        .cap = 10000,
-        .lock = PTHREAD_MUTEX_INITIALIZER,
-        .cond = PTHREAD_COND_INITIALIZER,
-        .shards = shards,
-        .n_shards = n,
-        .max_docs_per_shard = max_docs_per_shard,
-        .head = NULL,
-        .tail = NULL,
-    };
-
-    shard_spawn_workers(n_workers,&tq);
-    sockfd=socket(AF_INET,SOCK_DGRAM,0);
-    if (sockfd <= 0)
-        saypx("socket");
-
-    int op = 1;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &op, sizeof(int)) != 0 )
-        saypx("setsockopt");
-
-    bzero(&servaddr,sizeof(servaddr));
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr=htonl(INADDR_ANY);
-    servaddr.sin_port=htons(port);
-    bind(sockfd,(struct sockaddr *)&servaddr,sizeof(servaddr));
-    for (;;) {
-        slen = sizeof(cliaddr);
-        rc = recvfrom(sockfd,mesg,sizeof(mesg),0,(struct sockaddr *)&cliaddr,&slen);
-        if (rc > 0) {
-            execute_query(&tq,mesg,rc,cliaddr,sockfd);
-        }
-    }
-    // FIXME: cleanup.
+    RETVAL = newSViv(sockfd);
+OUTPUT:
+    RETVAL

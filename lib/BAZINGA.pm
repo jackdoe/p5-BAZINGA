@@ -25,10 +25,13 @@ BAZINGA - Perl extension for proof of concept pthreads + perl typo detection
 
   use BAZINGA;
   # start a bazinga server:
-  BAZINGA::index_and_serve($port,    # port for the udp server
-	                   $workers, # number of pthreads that will work on the task queue
+  BAZINGA::index_and_serve($port,        # port for the udp server
+	                   $workers,     # number of pthreads that will work on the task queue
 	                   $max_docs_per_shard,
-	                   ["hello world", "hello universe"]);
+	                   ["hello world", "hello universe"],
+                           $serve_in_background); # if != 0, listening thread will be spawned
+                                                  # and the call will return after indexing
+                                                  # otherwise it will block forever
 
   # or query a bazinga server:
   print BAZINGA::query("localhost",$port,"univerce",$timeout)

@@ -10,6 +10,7 @@ WriteMakefile(
       (ABSTRACT_FROM  => 'lib/BAZINGA.pm', # retrieve abstract from module
        AUTHOR         => 'borislav nikolov <jack@sofialondonmoskva.com>') : ()),
     LIBS              => ['-lpthread'], # e.g., '-lm'
+    OPTIMIZE          => '-O2',
     DEFINE            => '', # e.g., '-DHAVE_SOMETHING'
     INC               => '-I.', # e.g., '-I. -I/usr/include/other'
 	# Un-comment this if you add C files to link with later:

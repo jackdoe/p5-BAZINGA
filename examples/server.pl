@@ -7,6 +7,6 @@ my @docs = <$fh>;
 chomp $_ for @docs;
 close $fh;
 
-BAZINGA::index_and_serve(32000,20,10000,\@docs);
+BAZINGA::index_and_serve(32000,20,10000,\@docs,0);
 
 
