@@ -17,10 +17,11 @@
 #include <errno.h>
 #include <wchar.h>
 #include <sys/param.h>
+#include <limits.h>     /* for CHAR_BIT */
 #include "perl.h"
 #define MAX_PACKET_LEN 512
 #define MIN_SCORE 500
-#define MAX_QUERY_TERMS 10
+#define MAX_QUERY_TERMS 8
 #define NOW(x) ((float)clock()/CLOCKS_PER_SEC)
 #define FORMAT(fmt,arg...) fmt " [%s()]\n",##arg,__func__
 #define D(fmt,arg...) printf(FORMAT(fmt,##arg))
@@ -39,6 +40,13 @@ do {                                                \
 #define RLEN(s,index) ((s)->runes[(index)].len)
 #define RPREFIX(s) (RBYTE(s,0))
 #define PREFIXES 256
+
+#define BITMASK(b) (1 << ((b) % CHAR_BIT))
+#define BITSLOT(b) ((b) / CHAR_BIT)
+#define BITSET(a, b) ((a)[BITSLOT(b)] |= BITMASK(b))
+#define BITCLEAR(a, b) ((a)[BITSLOT(b)] &= ~BITMASK(b))
+#define BITTEST(a, b) ((a)[BITSLOT(b)] & BITMASK(b))
+#define BITNSLOTS(nb) ((nb + CHAR_BIT - 1) / CHAR_BIT)
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -383,10 +391,11 @@ u16 jscore(rstring *a, rstring *b) {
     return (((len - dist) * 1000) / (len + dist));
 }
 
-void shard_search(struct shard *shard, query *q, ranked_result ranked[]) {
+void shard_search(struct shard *shard, query *q, ranked_result ranked[], u8 *filter) {
     int i,max = -1, score;
     rstring *qs,*ts;
     ranked_result *r;
+
     for (qs = q->s, i = 0; qs != NULL && i < MAX_QUERY_TERMS; qs = qs->next, i++) {
         rune *last = NULL;
         for (ts = shard->terms[RPREFIX(qs)]; ts; ts = ts->next) {
@@ -395,12 +404,18 @@ void shard_search(struct shard *shard, query *q, ranked_result ranked[]) {
                 last = ts->runes;
             }
 
-            if (score == 0)
+            if (score < MIN_SCORE)
                 continue;
 
             r = &ranked[ts->local];
-            if (r->score == 0) {
+            if (!BITTEST(filter,ts->local)) {
+                BITSET(filter,ts->local);
                 memset(r,0,sizeof(*r));
+            }
+
+            if (r->score == 0 && i > 0) {
+                // require the first query term to match on something
+                continue;
             }
             if (r->ranked_terms[i].score < score) {
                 r->score -= r->ranked_terms[i].score;
@@ -450,14 +465,15 @@ void *shard_worker(void *p) {
     struct task_queue *tq = (struct task_queue *) p;
     struct task *t = NULL;
     size_t ranked_size = sizeof(struct ranked_result) * tq->max_docs_per_shard;
+    size_t filter_size = (tq->max_docs_per_shard / 8) + 1;
     ranked_result *ranked = x_malloc(ranked_size);
-    D("ping! allocated: %zukb ranked_result buffer for %d max_docs_per_shard",ranked_size/1024,tq->max_docs_per_shard);
+    u8 *filter = x_malloc(filter_size);
+    D("ping! allocated: %zukb ranked_result buffer for %d max_docs_per_shard, filter size: %zu",ranked_size/1024,tq->max_docs_per_shard,filter_size);
     int i;
     for (;;) {
         if (t) {
-            for (i = 0; i < tq->max_docs_per_shard; i++)
-                ranked[i].score = 0;
-            shard_search(t->shard,t->query,ranked);
+            shard_search(t->shard,t->query,ranked,filter);
+            memset(filter,0,filter_size);
             free(t);
         }
         pthread_mutex_lock(&tq->lock);
