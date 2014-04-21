@@ -1,0 +1,124 @@
+#include "EXTERN.h"
+#include "perl.h"
+#include "XSUB.h"
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <strings.h>
+#include <stdint.h>
+#include <time.h>
+#include <unistd.h>
+#include <pthread.h>
+#include "shard.h"
+#include "ppport.h"
+
+MODULE = BAZINGA		PACKAGE = BAZINGA		
+
+SV *
+query(SV *server, unsigned short port, SV *typo, int timeout_ms)
+    CODE:
+    RETVAL = &PL_sv_undef;
+    if (SvOK(server) && SvOK(typo)) {
+        struct sockaddr_in servaddr;
+        int sockfd = socket(AF_INET,SOCK_DGRAM,0);
+        if (sockfd > 0) {
+            struct timeval tv = { .tv_sec = 0, .tv_usec = timeout_ms * 1000};
+            if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,&tv,sizeof(tv)) == 0) {
+                bzero(&servaddr,sizeof(servaddr));
+                servaddr.sin_family      = AF_INET;
+                servaddr.sin_addr.s_addr = inet_addr(SvPV_nolen(server));
+                servaddr.sin_port        = htons(port);
+                int len = sv_len_utf8(typo);
+                if (sendto(sockfd,SvPV_nolen(typo),len,0,(struct sockaddr *)&servaddr,sizeof(servaddr)) == len) {
+                    char buf[MAX_PACKET_LEN];
+                    int n;
+                    if ((n = recvfrom(sockfd,buf,sizeof(buf),0,NULL,NULL)) > 0) {
+                        SV *ret = newSVpvn(buf, n);
+                        SvUTF8_on(ret);
+                        RETVAL = ret;
+                    }
+                }
+            }
+            close(sockfd);
+        }
+    } else {
+        RETVAL = &PL_sv_undef;
+    }
+    OUTPUT:
+        RETVAL
+
+void
+index_and_serve(unsigned short port, unsigned short n_workers,unsigned short max_docs_per_shard, SV *rdocs)
+    CODE:
+    if (!SvROK(rdocs) || SvTYPE(SvRV(rdocs)) != SVt_PVAV) {
+        croak("expected array ref of documents");
+    }
+    AV *docs = (AV *) SvRV(rdocs);
+    int len = av_len(docs),i,n,rc,sockfd;
+    n = 1 + (len / max_docs_per_shard);
+
+    int ndocs[n];
+    rstring *shards[n];
+
+    struct sockaddr_in servaddr,cliaddr;
+    socklen_t slen;
+    char mesg[MAX_PACKET_LEN];
+
+    memset(ndocs,0,sizeof(ndocs));
+    memset(shards,0,sizeof(shards));
+    for (i = 0; i < len; i++) {
+        SV **svp = av_fetch(docs,i,0);
+        
+        if (svp == NULL || !SvOK(*svp))
+            continue;
+
+        STRLEN blen;
+        char *buf = SvPV(*svp,blen);
+        int id = i % n;
+        rstring *tokens = rstring_tokenize_into_chain(buf,blen,DELIM), *ts;
+        for (ts = tokens; ts; ts = ts->next) {
+            ts->local = ndocs[id];
+            if (ts->next == NULL) {
+                // make the last token point to the current head
+                ts->next = shards[id];
+                shards[id] = tokens;
+                break;
+            }
+        }
+        ndocs[id]++;
+    }
+
+    D("index is ready with %d shards",n);
+    struct task_queue tq = {
+        .cap = 10000,
+        .lock = PTHREAD_MUTEX_INITIALIZER,
+        .cond = PTHREAD_COND_INITIALIZER,
+        .shards = shards,
+        .n_shards = n,
+        .max_docs_per_shard = max_docs_per_shard,
+        .head = NULL,
+        .tail = NULL,
+    };
+
+    shard_spawn_workers(n_workers,&tq);
+    sockfd=socket(AF_INET,SOCK_DGRAM,0);
+    if (sockfd <= 0)
+        saypx("socket");
+
+    int op = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &op, sizeof(int)) != 0 )
+        saypx("setsockopt");
+
+    bzero(&servaddr,sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr=htonl(INADDR_ANY);
+    servaddr.sin_port=htons(port);
+    bind(sockfd,(struct sockaddr *)&servaddr,sizeof(servaddr));
+    for (;;) {
+        slen = sizeof(cliaddr);
+        rc = recvfrom(sockfd,mesg,sizeof(mesg),0,(struct sockaddr *)&cliaddr,&slen);
+        if (rc > 0) {
+            execute_query(&tq,mesg,rc,cliaddr,sockfd);
+        }
+    }

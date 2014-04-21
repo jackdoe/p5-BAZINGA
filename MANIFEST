@@ -1,0 +1,8 @@
+BAZINGA.xs
+Changes
+Makefile.PL
+MANIFEST
+ppport.h
+README.pod
+t/BAZINGA.t
+lib/BAZINGA.pm
