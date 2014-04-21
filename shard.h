@@ -312,7 +312,7 @@ static int tq_enqueue(struct task_queue *tq,struct query *q) {
     }
 
     tq->cap -= tq->n_shards;
-    pthread_cond_signal(&tq->cond);
+    pthread_cond_broadcast(&tq->cond);
     pthread_mutex_unlock(&tq->lock);
     return 0;
 }
