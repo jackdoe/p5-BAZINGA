@@ -90,9 +90,14 @@ struct query {
 
 typedef struct query query;
 
+struct shard {
+    rstring *terms[256];
+    int ndocs;
+};
+
 struct task {
     query *query;
-    rstring *shard;
+    struct shard *shard;
     struct task *next;
 };
 
@@ -104,7 +109,7 @@ struct task_queue {
     int max_docs_per_shard;
     pthread_mutex_t lock;
     pthread_cond_t cond;
-    rstring **shards;
+    struct shard *shards;
 };
 
 void *x_realloc(void *x, size_t n) {
@@ -305,7 +310,7 @@ static int tq_enqueue(struct task_queue *tq,struct query *q) {
     pthread_mutex_lock(&tq->lock);
     for (j = 0; j < tq->n_shards; j++) {
         struct task *t = x_malloc(sizeof(*t));
-        t->shard = tq->shards[j];
+        t->shard = &tq->shards[j];
         t->query = q;
         t->next = NULL;
         Q_APPEND(tq->head,tq->tail,t);
@@ -359,7 +364,7 @@ u16 jscore(rstring *a, rstring *b) {
     return (((len - dist) * 1000) / (len + dist));
 }
 
-void shard_search(rstring *terms, query *q, ranked_result *ranked) {
+void shard_search(struct shard *shard, query *q, ranked_result *ranked) {
     int i;
     rstring *qs,*ts;
     ranked_result *r;
@@ -368,9 +373,7 @@ void shard_search(rstring *terms, query *q, ranked_result *ranked) {
     int max = -1;
     for (qs = q->s, i = 0; qs != NULL && i < MAX_QUERY_TERMS; qs = qs->next, i++) {
         rune *last = NULL;
-        for (ts = terms; ts; ts = ts->next) {
-            if (RBYTE(ts,0) != RBYTE(qs,0))
-                continue;
+        for (ts = shard->terms[RBYTE(qs,0)]; ts; ts = ts->next) {
             if (last == NULL || last != ts->runes) {
                 score = jscore(qs,ts);
                 last = ts->runes;

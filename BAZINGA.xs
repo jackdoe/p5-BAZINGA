@@ -58,15 +58,11 @@ index_and_serve(unsigned short port, unsigned short n_workers,unsigned short max
     AV *docs = (AV *) SvRV(rdocs);
     int len = av_len(docs),i,n,rc,sockfd;
     n = 1 + (len / max_docs_per_shard);
-
-    int ndocs[n];
-    rstring *shards[n];
-
+    struct shard shards[n];
     struct sockaddr_in servaddr,cliaddr;
     socklen_t slen;
     char mesg[MAX_PACKET_LEN];
 
-    memset(ndocs,0,sizeof(ndocs));
     memset(shards,0,sizeof(shards));
     HV* dup = newHV();
     SV* bsv = newSVpvn("",0);
@@ -85,7 +81,9 @@ index_and_serve(unsigned short port, unsigned short n_workers,unsigned short max
         char *buf = SvPV(*svp,blen);
         int id = i % n;
         rstring *tokens = rstring_tokenize_into_chain(buf,blen,DELIM), *ts;
-        for (ts = tokens; ts; ts = ts->next) {
+
+        rstring *tmp;
+        for (ts = tokens; ts;) {
             // since we have some state in the rstring
             // we will copy it into SV, and check for duplication
             // so we can reuse the same rune *pointer
@@ -100,20 +98,20 @@ index_and_serve(unsigned short port, unsigned short n_workers,unsigned short max
             }
             sv_setpvn(bsv,"", 0);
 
-            ts->local = ndocs[id];
-            if (ts->next == NULL) {
-                // make the last token point to the current head
-                ts->next = shards[id];
-                shards[id] = tokens;
-                break;
-            }
+            ts->local = shards[id].ndocs;
+            tmp = ts->next;
+            ts->next = shards[id].terms[RBYTE(ts,0)];
+            shards[id].terms[RBYTE(ts,0)] = ts;
+            ts = tmp;
         }
-        ndocs[id]++;
+        shards[id].ndocs++;
     }
     hv_undef(dup);
-
+    int j;
     for (i = 0; i < n; i++) {
-        shards[i] = listsort(shards[i]);
+        for (j = 0; j < 256; j++) {
+            shards[i].terms[j] = listsort(shards[i].terms[j]);
+        }
     }
 
     D("index is ready with %d shards",n);
