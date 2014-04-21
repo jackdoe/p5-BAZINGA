@@ -17,15 +17,17 @@
 #include <errno.h>
 #include <wchar.h>
 #include <sys/param.h>
+#include "perl.h"
 #define MAX_PACKET_LEN 512
 
 #define NOW(x) ((float)clock()/CLOCKS_PER_SEC)
 
 #define FORMAT(fmt,arg...) fmt " [%s()]\n",##arg,__func__
-#define D(fmt,arg...) printf(FORMAT(fmt,##arg))
-#define sayx(fmt,arg...) do {                           \
-                             die(FORMAT(fmt,##arg));    \
-                             } while(0)
+#define D(fmt,arg...) fprintf(stderr,FORMAT(fmt,##arg))
+#define sayx(fmt,arg...)                            \
+do {                                                \
+    die(FORMAT(fmt,##arg));                         \
+} while(0)
 
 #define saypx(fmt,arg...) sayx(fmt " { %s(%d) }",##arg,errno ? strerror(errno) : "undefined error",errno);
 
@@ -98,11 +100,11 @@ struct task_queue {
     struct task *head;
     struct task *tail;
     int cap;
-    rstring **shards;
     int n_shards;
     int max_docs_per_shard;
     pthread_mutex_t lock;
     pthread_cond_t cond;
+    rstring **shards;
 };
 
 void *x_realloc(void *x, size_t n) {
@@ -120,13 +122,6 @@ void *x_malloc(size_t n) {
 static u32 HASH_P = 5381;
 static u32 DELIM = ' ';
 static u8 U_MASK[] = {192, 224, 240};
-#define RUPDATE_LEN(r)                                                  \
-    do {                                                                \
-        if ((dest->value.u8[0] & U_MASK[0]) == U_MASK[0]) dest->len++;  \
-        if ((dest->value.u8[0] & U_MASK[1]) == U_MASK[1]) dest->len++;  \
-        if ((dest->value.u8[0] & U_MASK[2]) == U_MASK[2]) dest->len++;  \
-    } while(0);
-
 // http://zaemis.blogspot.nl/2011/06/reading-unicode-utf-8-by-hand-in-c.html
 int rune_bread(char *buf, off_t *off, size_t blen, rune *dest) {
     dest->len = 0;
@@ -137,7 +132,9 @@ int rune_bread(char *buf, off_t *off, size_t blen, rune *dest) {
     dest->value.u8[0] = buf[*off];
     dest->len = 1;
 
-    RUPDATE_LEN(dest);
+    if ((dest->value.u8[0] & U_MASK[0]) == U_MASK[0]) dest->len++;
+    if ((dest->value.u8[0] & U_MASK[1]) == U_MASK[1]) dest->len++;
+    if ((dest->value.u8[0] & U_MASK[2]) == U_MASK[2]) dest->len++;
 
     if (dest->len > 1) {
         if (blen - *off < dest->len) {
@@ -166,6 +163,14 @@ rstring *rstring_new(void) {
     return s;
 }
 
+void rstring_rerune(rstring *dst, rstring *src) {
+    free(dst->runes);
+    dst->runes = src->runes;
+    dst->alen = src->alen;
+    dst->rlen = src->rlen;
+    dst->key = src->key;
+}
+
 void rstring_free(rstring *s) {
     if (s->next)
         rstring_free(s->next);
@@ -187,11 +192,11 @@ void rstring_dump(rstring *s,int follow) {
     }
 }
 
-
 rstring * rstring_radd(rstring *s, rune *r) {
     s->rlen++;
     rstring_prepare(s);
     s->runes[s->rlen - 1] = *r;
+    // build a hash key as we are building the string
     s->key = (s->key << 5) + HASH_P;
     return s;
 }
@@ -206,6 +211,15 @@ int rstring_equal(rstring *a, rstring *b) {
             return 0;
     }
     return 1;
+}
+
+int rstring_cmp(rstring *a, rstring *b) {
+    int i;
+    for (i = 0; i < a->rlen; i++) {
+        if (RVAL(a,i) != RVAL(b,i))
+            return (RVAL(a,i) > RVAL(b,i)) ? 1 : -1;
+    }
+    return 0;
 }
 
 static  int rstring_hamming_n(rstring *a, rstring *b, int n, int give_up) {
@@ -258,6 +272,18 @@ rstring *rstring_tokenize_into_chain(char *buf, size_t blen,u32 delim) {
     return s;
 }
 
+rstring *rstring_chain_reverse(rstring *s) {
+    rstring *sn = NULL,*next;
+
+    while (s) {
+        next = s->next;
+        s->next = sn;
+        sn = s;
+        s = next;
+    }
+    return sn;
+}
+
 int rstring_to_char(rstring *s, char *dest, int n) {
     int i;
     int off = 0;
@@ -270,6 +296,54 @@ int rstring_to_char(rstring *s, char *dest, int n) {
     return off;
 }
 
+void rstring_into_sv(rstring *s, SV* dest) {
+    int i;
+    for(i = 0; i < s->rlen; i++) {
+        sv_catpvn(dest,(char *) &RVAL(s,i),RLEN(s,i));
+    }
+}
+
+int rstring_chain_count(rstring *s) {
+    rstring *tmp = s;
+    int n = 0;
+    while (tmp) {
+        n++;
+        tmp = tmp->next;
+    }
+    return n;
+}
+
+void rstring_swap(rstring *a, rstring *b) {
+    rstring tmp = *a, *tmpnext[2];
+    tmpnext[0] = a->next;
+    tmpnext[1] = b->next;
+    *a = *b;
+    *b = tmp;
+    a->next = tmpnext[0];
+    b->next = tmpnext[1];
+}
+
+// n^2, but shards should be small enough so that does not matter
+// if the shards are so big that this is noticable, then we need more shards
+void rstring_chain_sort_nsquared(rstring *head) {
+    int n = rstring_chain_count(head);
+    int i, j;
+    struct rstring *p, *q ;
+    p = head;
+    for (i = 0; i < n - 1 ;i++) {
+        q = p->next;
+
+        for (j = i + 1; j < n ;j++) {
+            if (rstring_cmp(p,q) > 0){
+                rstring_swap(p,q);
+            }
+            q = q->next;
+        }
+        p = p->next;
+    }
+}
+
+
 void tq_wait_for_work(struct task_queue *tq) {
     pthread_mutex_lock(&tq->lock);
     // if there is still work, just return, otherwise wait on the condition
@@ -278,27 +352,31 @@ void tq_wait_for_work(struct task_queue *tq) {
         pthread_cond_wait(&tq->cond,&tq->lock);
     pthread_mutex_unlock(&tq->lock);
 }
-
+#define Q_APPEND(head,tail,elem)                                \
+    do {                                                        \
+        if ((head) == NULL)                                     \
+            (head) = (elem);                                    \
+        else                                                    \
+            (tail)->next = (elem);                              \
+        (tail) = (elem);                                        \
+    } while(0);
 static int tq_enqueue(struct task_queue *tq,struct query *q) {
     if (tq->cap < 1)
         return -1;
-    // FIXME: too much work under lock.
-    pthread_mutex_lock(&tq->lock);
     int j;
+    struct task *head = NULL, *tail = NULL;
+
     for (j = 0; j < tq->n_shards; j++) {
         struct task *t = x_malloc(sizeof(*t));
         t->shard = tq->shards[j];
         t->query = q;
         t->next = NULL;
-        tq->cap--;
-        
-        if (tq->head == NULL)
-            tq->head = t;
-        else
-            tq->tail->next = t;
-        tq->tail = t;
+        Q_APPEND(head,tail,t);
     }
 
+    pthread_mutex_lock(&tq->lock);
+    tq->cap -= tq->n_shards;
+    Q_APPEND(tq->head,tq->tail,head);
     pthread_cond_signal(&tq->cond);
     pthread_mutex_unlock(&tq->lock);
     return 0;
@@ -323,7 +401,7 @@ static void query_destroy(query *q) {
 
 void execute_query(struct task_queue *tq, char *buf,int blen,struct sockaddr_in sa,int fd) {
     struct query *q = x_malloc(sizeof(*q));
-    q->s = rstring_tokenize_into_chain(buf,blen,DELIM);
+    q->s = rstring_chain_reverse(rstring_tokenize_into_chain(buf,blen,DELIM));
     pthread_mutex_init(&q->lock,NULL);
     q->dest_fd = fd;
     q->dest_sa = sa;
@@ -340,12 +418,11 @@ u16 jscore(rstring *a, rstring *b) {
     if (a->rlen == 0 || b->rlen == 0)
         return 0;
 
-    if (a == b || rstring_equal(a,b))
+    if (rstring_equal(a,b))
         return 1000;
     int give_up =  MIN(b->rlen,a->rlen) / 2;
     if (rstring_hamming_smallest(a,b,give_up) >= give_up)
         return 0;
-
     u32 dist = rstring_levenshtein(a,b);
     u32 len = MAX(a->rlen,b->rlen);
     return (((len - dist) * 1000) / (len + dist));
@@ -353,16 +430,20 @@ u16 jscore(rstring *a, rstring *b) {
 
 void shard_search(rstring *terms, query *q, ranked_result *ranked) {
     int i;
-    struct rstring *qs,*ts;
+    rstring *qs,*ts;
     ranked_result *r;
 
     u32 score = 0;
     int max = -1;
     for (qs = q->s, i = 0; qs != NULL && i < MAX_QUERY_TERMS; qs = qs->next, i++) {
+        rune *last = NULL;
         for (ts = terms; ts; ts = ts->next) {
             if (RBYTE(ts,0) != RBYTE(qs,0))
                 continue;
-            score = jscore(qs,ts);
+            if (last == NULL || last != ts->runes) {
+                score = jscore(qs,ts);
+                last = ts->runes;
+            }
             if (score == 0)
                 continue;
             r = &ranked[ts->local];

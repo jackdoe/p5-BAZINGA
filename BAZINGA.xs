@@ -18,6 +18,8 @@ MODULE = BAZINGA		PACKAGE = BAZINGA
 SV *
 query(SV *server, unsigned short port, SV *typo, int timeout_ms)
     CODE:
+    if (timeout_ms > 999)
+        croak("timeout_ms can be between 1 and 999");
     RETVAL = &PL_sv_undef;
     if (SvOK(server) && SvOK(typo)) {
         struct sockaddr_in servaddr;
@@ -67,6 +69,13 @@ index_and_serve(unsigned short port, unsigned short n_workers,unsigned short max
 
     memset(ndocs,0,sizeof(ndocs));
     memset(shards,0,sizeof(shards));
+    HV* dup = newHV();
+    SV* bsv = newSVpvn("",0);
+    // FIXME: this whole thing must be rewritten
+    // at the moment it checks for uniqueness using the dup hash
+    // and points strings to use same rune pointers
+    // so we can quickly check if a term is equal to another term
+    // just by checking its runes pointer
     for (i = 0; i < len; i++) {
         SV **svp = av_fetch(docs,i,0);
         
@@ -78,6 +87,19 @@ index_and_serve(unsigned short port, unsigned short n_workers,unsigned short max
         int id = i % n;
         rstring *tokens = rstring_tokenize_into_chain(buf,blen,DELIM), *ts;
         for (ts = tokens; ts; ts = ts->next) {
+            // since we have some state in the rstring
+            // we will copy it into SV, and check for duplication
+            // so we can reuse the same rune *pointer
+            rstring_into_sv(ts,bsv);
+            STRLEN len;
+            char *key = SvPV(bsv, len);
+            SV **existing = hv_fetch(dup,key,len,0);
+            if (existing != NULL && SvOK(*existing)) {
+                rstring_rerune(ts,(rstring *) SvPV_nolen(*existing));
+            } else {
+                hv_store(dup,key,len,newSVpvn((char *)ts,sizeof(*ts)),0);
+            }
+            sv_setpvn(bsv,"", 0);
             ts->local = ndocs[id];
             if (ts->next == NULL) {
                 // make the last token point to the current head
@@ -88,10 +110,15 @@ index_and_serve(unsigned short port, unsigned short n_workers,unsigned short max
         }
         ndocs[id]++;
     }
+    hv_undef(dup);
+
+    for (i = 0; i < n; i++) {
+        rstring_chain_sort_nsquared(shards[i]);
+    }
 
     D("index is ready with %d shards",n);
     struct task_queue tq = {
-        .cap = 10000,
+        .cap = 100000,
         .lock = PTHREAD_MUTEX_INITIALIZER,
         .cond = PTHREAD_COND_INITIALIZER,
         .shards = shards,

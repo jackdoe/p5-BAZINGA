@@ -17,10 +17,11 @@ $SIG{PIPE} = 'IGNORE';
 
 my $pid = fork();
 if ($pid) {
-   BAZINGA::index_and_serve(32000,10,1000,[("asdasd") x 100000]);
+   BAZINGA::index_and_serve(32000,10,1000,[ (("hello universe") x 100000) ]);
 }
-sleep(1);
-is(BAZINGA::query("127.0.0.1",32000,"asxasd",100),"asdasd");
+sleep(5);
+is(BAZINGA::query("127.0.0.1",32000,"univerce",200),"universe");
+is(BAZINGA::query("127.0.0.1",32000,"hallo univerce",200),"hello universe");
 sleep(1);
 kill(9,$pid);
 
