@@ -480,8 +480,8 @@ void *shard_worker(void *p) {
     int i;
     while (!tq->ABORT) {
         if (t) {
-            shard_search(t->shard,t->query,ranked,filter);
             memset(filter,0,filter_size);
+            shard_search(t->shard,t->query,ranked,filter);
             free(t);
         }
         pthread_mutex_lock(&tq->lock);
